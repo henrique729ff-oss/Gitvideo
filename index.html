@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vídeo para animação GLB</title>
+<style>
+:root{color-scheme:light dark;--bg:#f4f4f6;--fg:#1a1a1f;--card:#ffffff;--acc:#e8602c}
+@media (prefers-color-scheme: dark){:root{--bg:#121216;--fg:#eeeeee;--card:#1d1d24;--acc:#ff7a45}}
+:root[data-theme="dark"]{--bg:#121216;--fg:#eeeeee;--card:#1d1d24;--acc:#ff7a45}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);
+  padding:calc(env(safe-area-inset-top,0px) + 12px) 12px calc(env(safe-area-inset-bottom,0px) + 12px)}
+h1{font-size:20px;margin:4px 0 8px}
+.card{background:var(--card);border-radius:12px;padding:12px;margin:10px 0}
+label{display:block;margin:8px 0;font-size:14px}
+input[type=number]{width:70px;padding:4px}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:15px;margin:4px 6px 4px 0}
+button:disabled{opacity:.5}
+.pick{display:block;width:100%;text-align:left;margin:8px 0 2px 0}
+.fname{display:block;font-size:13px;opacity:.75;margin:0 0 6px 2px;word-break:break-all}
+video,canvas{width:100%;border-radius:10px;background:#000;display:block}
+#log{font-size:13px;white-space:pre-wrap;margin-top:8px;opacity:.85;min-height:1em}
+small{opacity:.7}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<h1>Vídeo para animação GLB</h1>
+
+<div class="card">
+  <button class="pick" data-target="vid">1. Escolher vídeo (corpo inteiro, câmera parada)</button>
+  <span class="fname" id="vidName">nenhum arquivo</span>
+  <input type="file" id="vid" accept="video/*" hidden>
+  <button class="pick" data-target="glb">2. Escolher personagem Mixamo (.glb)</button>
+  <span class="fname" id="glbName">nenhum arquivo</span>
+  <input type="file" id="glb" accept=".glb,model/gltf-binary,application/octet-stream" hidden>
+  <button class="pick" data-target="task">3. Modelo de pose .task (opcional)</button>
+  <span class="fname" id="taskName">nenhum arquivo (usa o download automático)</span>
+  <input type="file" id="task" accept=".task,application/octet-stream" hidden>
+  <label>Quadros por segundo <input type="number" id="fps" value="20" min="5" max="60"></label>
+  <label><input type="checkbox" id="fx" checked> inverter eixo X</label>
+  <label><input type="checkbox" id="fy" checked> inverter eixo Y</label>
+  <label><input type="checkbox" id="fz"> inverter eixo Z</label>
+  <small>Se os movimentos saírem espelhados ou de cabeça para baixo, mude estas opções e processe de novo.</small>
+</div>
+
+<div class="card">
+  <video id="player" controls playsinline></video>
+  <canvas id="view" height="300"></canvas>
+</div>
+
+<div class="card">
+  <button id="go" disabled>Processar vídeo</button>
+  <button id="prev" disabled>Ver preview</button>
+  <button id="exp" disabled>Baixar GLB</button>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {GLTFExporter} from 'three/addons/exporters/GLTFExporter.js';
+import {FilesetResolver, PoseLandmarker} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent += m + '\n'; };
+
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task';
+
+// Nome do osso sem ":" e sem sufixo numérico: "mixamorig:LeftArm_09" -> "mixamorigLeftArm"
+const boneKey = s => s.replace(':', '').replace(/_\d+$/, '');
+
+// [osso animado, filho(s) que definem a direção, ponto inicial, ponto final]
+const SEG = [
+  ['mixamorigSpine',        ['mixamorigSpine1', 'mixamorigSpine2', 'mixamorigNeck'], 'midHip', 'midSh'],
+  ['mixamorigLeftUpLeg',    'mixamorigLeftLeg',     23, 25],
+  ['mixamorigLeftLeg',      'mixamorigLeftFoot',    25, 27],
+  ['mixamorigRightUpLeg',   'mixamorigRightLeg',    24, 26],
+  ['mixamorigRightLeg',     'mixamorigRightFoot',   26, 28],
+  ['mixamorigLeftArm',      'mixamorigLeftForeArm', 11, 13],
+  ['mixamorigLeftForeArm',  'mixamorigLeftHand',    13, 15],
+  ['mixamorigRightArm',     'mixamorigRightForeArm', 12, 14],
+  ['mixamorigRightForeArm', 'mixamorigRightHand',   14, 16],
+];
+
+// ---------- cena ----------
+const renderer = new THREE.WebGLRenderer({canvas: $('view'), antialias: true, alpha: true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const cam = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
+cam.position.set(0, 1.1, 3.4);
+cam.lookAt(0, 0.9, 0);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(2, 4, 3);
+scene.add(sun);
+const holder = new THREE.Group();
+scene.add(holder);
+
+function resize() {
+  const w = $('view').clientWidth || 300;
+  renderer.setSize(w, 300, false);
+  cam.aspect = w / 300;
+  cam.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- estado ----------
+let videoFile = null, glbFile = null, taskFile = null;
+let character = null, clip = null, mixer = null, landmarker = null, exporting = false;
+let bonesAll = [], restLocal = new Map(), restWorld = new Map(), parentRest = new Map(), segs = new Map();
+let hipsInfo = null;
+
+// Preview: o personagem segue o tempo do vídeo a cada quadro.
+renderer.setAnimationLoop(() => {
+  if (mixer && clip && !exporting) {
+    const action = mixer.clipAction(clip);
+    const v = $('player');
+    action.paused = true;
+    action.time = Math.min(v.currentTime, clip.duration);
+    mixer.update(0);
+  }
+  renderer.render(scene, cam);
+});
+
+// ---------- entradas ----------
+['vid', 'glb', 'task'].forEach(id => $(id).addEventListener('change', e => {
+  const f = e.target.files[0];
+  $(id + 'Name').textContent = f ? f.name : 'nenhum arquivo';
+}));
+document.querySelectorAll('.pick').forEach(b => b.onclick = () => $(b.dataset.target).click());
+
+$('vid').onchange = e => {
+  videoFile = e.target.files[0] || null;
+  if (videoFile) $('player').src = URL.createObjectURL(videoFile);
+  clip = null; mixer = null;
+  $('prev').disabled = true; $('exp').disabled = true;
+  checkReady();
+};
+$('glb').onchange = async e => {
+  glbFile = e.target.files[0] || null;
+  if (glbFile) {
+    try { await loadCharacter(glbFile); } catch (err) { log('erro ao carregar o personagem: ' + err.message); }
+  }
+  checkReady();
+};
+$('task').onchange = e => {
+  taskFile = e.target.files[0] || null;
+  landmarker = null;
+};
+$('go').onclick = processVideo;
+$('prev').onclick = () => {
+  const v = $('player');
+  if (!clip) return;
+  v.paused ? v.play() : v.pause();
+};
+$('exp').onclick = exportGLB;
+
+const pv = $('player');
+pv.addEventListener('play', () => { if (clip) $('prev').textContent = 'Pausar preview'; });
+pv.addEventListener('pause', () => { $('prev').textContent = 'Ver preview'; });
+
+function checkReady() {
+  $('go').disabled = !(videoFile && character);
+}
+
+// ---------- personagem ----------
+async function loadCharacter(file) {
+  const url = URL.createObjectURL(file);
+  const gltf = await new GLTFLoader().loadAsync(url);
+  if (character) holder.remove(character);
+  character = gltf.scene;
+  holder.add(character);
+  holder.position.set(0, 0, 0);
+  holder.scale.set(1, 1, 1);
+  holder.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(character);
+  const s = 1.7 / Math.max(0.0001, box.max.y - box.min.y);
+  holder.scale.setScalar(s);
+  holder.updateMatrixWorld(true);
+  const b2 = new THREE.Box3().setFromObject(holder);
+  holder.position.y -= b2.min.y;
+
+  prepareRig();
+  mixer = null;
+  clip = null;
+  $('prev').disabled = true;
+  $('exp').disabled = true;
+  log(`personagem carregado: ${bonesAll.length} ossos, ${segs.size} de 9 mapeados`);
+}
+
+function prepareRig() {
+  character.traverse(o => { if (o.isBone) o.name = boneKey(o.name); });
+  character.updateMatrixWorld(true);
+  const rootQInv = character.getWorldQuaternion(new THREE.Quaternion()).invert();
+  const invM = character.matrixWorld.clone().invert();
+  const toCharPos = o => o.getWorldPosition(new THREE.Vector3()).applyMatrix4(invM);
+
+  bonesAll = [];
+  character.traverse(o => { if (o.isBone) bonesAll.push(o); });
+  restLocal = new Map(); restWorld = new Map(); parentRest = new Map(); segs = new Map();
+
+  for (const b of bonesAll) {
+    restLocal.set(b, b.quaternion.clone());
+    restWorld.set(b, rootQInv.clone().multiply(b.getWorldQuaternion(new THREE.Quaternion())));
+    if (!b.parent || !b.parent.isBone) {
+      parentRest.set(b, rootQInv.clone().multiply(
+        b.parent ? b.parent.getWorldQuaternion(new THREE.Quaternion()) : new THREE.Quaternion()));
+    }
+  }
+
+  const byName = new Map(bonesAll.map(b => [b.name, b]));
+  const missing = [];
+  for (const [bn, cands, a, bb] of SEG) {
+    const bone = byName.get(bn);
+    const cs = Array.isArray(cands) ? cands : [cands];
+    const child = cs.map(n => byName.get(n)).find(Boolean);
+    if (!bone || !child) { missing.push(bn); continue; }
+    const restDir = toCharPos(child).sub(toCharPos(bone)).normalize();
+    segs.set(bone, {restDir, restWorld: restWorld.get(bone), a, b: bb});
+  }
+  hipsInfo = null;
+  const hips = byName.get('mixamorigHips');
+  const lUp = byName.get('mixamorigLeftUpLeg'), rUp = byName.get('mixamorigRightUpLeg');
+  const top = byName.get('mixamorigSpine2') || byName.get('mixamorigSpine1') || byName.get('mixamorigSpine');
+  if (hips && lUp && rUp && top) {
+    const hp = toCharPos(hips);
+    const X = toCharPos(rUp).sub(toCharPos(lUp));
+    const Y = toCharPos(top).sub(hp);
+    const restBasisQ = basisQuat(X, Y);
+    const parentW = hips.parent ? hips.parent.matrixWorld.clone() : new THREE.Matrix4();
+    const T = parentW.invert().multiply(character.matrixWorld);
+    hipsInfo = {bone: hips, restBasisQ, restHipPos: hp, restTorso: hp.distanceTo(toCharPos(top)), T};
+    segs.set(hips, {hips: true, restWorld: restWorld.get(hips)});
+  } else {
+    missing.push('mixamorigHips');
+  }
+  if (missing.length) log('ossos não encontrados: ' + missing.join(', '));
+}
+
+// ---------- pose do MediaPipe ----------
+async function getLandmarker() {
+  if (landmarker) return landmarker;
+  const vision = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const opts = {baseOptions: {}, runningMode: 'IMAGE', numPoses: 1};
+  if (taskFile) opts.baseOptions.modelAssetBuffer = new Uint8Array(await taskFile.arrayBuffer());
+  else opts.baseOptions.modelAssetPath = MODEL_URL;
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts);
+  } catch (err) {
+    throw new Error('não consegui carregar o modelo de pose. Envie o arquivo pose_landmarker_full.task no campo 3.');
+  }
+  return landmarker;
+}
+
+function toThree(p) {
+  return new THREE.Vector3(
+    $('fx').checked ? -p.x : p.x,
+    $('fy').checked ? -p.y : p.y,
+    $('fz').checked ? -p.z : p.z);
+}
+
+function basisQuat(X, Y) {
+  const x = X.clone().normalize();
+  const z = x.clone().cross(Y).normalize();
+  const y = z.clone().cross(x).normalize();
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+}
+
+function median(a) {
+  if (!a.length) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  return s[s.length >> 1];
+}
+
+function pt(lm, k) {
+  if (k === 'midHip' || k === 'midSh') {
+    const [i, j] = k === 'midHip' ? [23, 24] : [11, 12];
+    if (lm[i].visibility < 0.3 || lm[j].visibility < 0.3) return null;
+    return toThree(lm[i]).add(toThree(lm[j])).multiplyScalar(0.5);
+  }
+  if (!lm[k] || lm[k].visibility < 0.3) return null;
+  return toThree(lm[k]);
+}
+
+function solveFrame(lm) {
+  const W = new Map();
+  const L = {};
+  for (const b of bonesAll) {
+    const pW = (b.parent && b.parent.isBone) ? W.get(b.parent) : parentRest.get(b);
+    const seg = segs.get(b);
+    let w;
+    if (seg && seg.hips) {
+      const lh = pt(lm, 23), rh = pt(lm, 24), mh = pt(lm, 'midHip'), ms = pt(lm, 'midSh');
+      if (!lh || !rh || !mh || !ms) return null;
+      const X = rh.sub(lh), Y = ms.sub(mh);
+      if (X.lengthSq() < 1e-8 || Y.lengthSq() < 1e-8) return null;
+      const delta = basisQuat(X, Y).multiply(hipsInfo.restBasisQ.clone().invert());
+      w = delta.multiply(seg.restWorld);
+    } else if (seg) {
+      const a = pt(lm, seg.a), c = pt(lm, seg.b);
+      if (!a || !c) return null;
+      const d = c.sub(a);
+      if (d.lengthSq() < 1e-8) return null;
+      const dq = new THREE.Quaternion().setFromUnitVectors(seg.restDir, d.normalize());
+      w = dq.multiply(seg.restWorld);
+    } else {
+      w = pW.clone().multiply(restLocal.get(b));
+    }
+    W.set(b, w);
+    L[b.name] = pW.clone().invert().multiply(w);
+  }
+  return L;
+}
+
+function seekTo(v, t) {
+  return new Promise(res => {
+    if (Math.abs(v.currentTime - t) < 1e-3) return res();
+    const done = () => { v.removeEventListener('seeked', done); res(); };
+    v.addEventListener('seeked', done);
+    v.currentTime = t;
+    setTimeout(res, 1500);
+  });
+}
+
+function videoReady(v) {
+  return new Promise(res => {
+    if (v.readyState >= 1) return res();
+    v.addEventListener('loadedmetadata', () => res(), {once: true});
+  });
+}
+
+// ---------- processamento ----------
+async function processVideo() {
+  if (!character || !videoFile) return;
+  $('go').disabled = true;
+  $('prev').disabled = true;
+  $('exp').disabled = true;
+  $('log').textContent = '';
+  const v = $('player');
+  v.pause();
+  try {
+    if (segs.size === 0) throw new Error('nenhum osso do personagem foi reconhecido. O .glb precisa ser um rig Mixamo.');
+    log('carregando modelo de pose...');
+    const lmk = await getLandmarker();
+    await videoReady(v);
+
+    const fps = Math.max(5, Math.min(60, +$('fps').value || 20));
+    const dur = v.duration;
+    const n = Math.max(2, Math.floor(dur * fps) + 1);
+    const names = [...segs.keys()].map(b => b.name);
+    const vals = {};
+    names.forEach(k => vals[k] = []);
+    const times = [];
+    let prev = null, ok = 0;
+    const hipRaw = [];
+
+    for (let i = 0; i < n; i++) {
+      const t = Math.min(i / fps, Math.max(0, dur - 0.05));
+      await seekTo(v, t);
+      const res = lmk.detect(v);
+      const wl = res.worldLandmarks && res.worldLandmarks[0];
+      const il = res.landmarks && res.landmarks[0];
+      let cur = wl ? solveFrame(wl) : null;
+      const raw = il ? {
+        hy: (il[23].y + il[24].y) / 2,
+        tn: Math.abs((il[11].y + il[12].y) / 2 - (il[23].y + il[24].y) / 2)
+      } : null;
+      if (cur) {
+        ok++;
+        if (prev) for (const k of names) cur[k].slerp(prev[k], 0.4);
+      } else {
+        cur = prev || (() => {
+          const r = {};
+          for (const b of bonesAll) r[b.name] = restLocal.get(b);
+          return r;
+        })();
+      }
+      prev = cur;
+      hipRaw.push(raw);
+      times.push(i / fps);
+      for (const k of names) vals[k].push(...cur[k].toArray());
+      if (i % 20 === 0) log(`quadro ${i + 1}/${n}`);
+    }
+
+    // sobe e desce do quadril (o "pulinho" da corrida), em unidades do personagem
+    const valid = hipRaw.filter(Boolean);
+    const refHy = median(valid.map(r => r.hy));
+    const refTn = median(valid.map(r => r.tn)) || 1;
+    const rt = hipsInfo ? hipsInfo.restTorso : 1;
+    const hipPos = [];
+    let lastOff = 0;
+    for (let i = 0; i < n && hipsInfo; i++) {
+      if (hipRaw[i]) lastOff = (refHy - hipRaw[i].hy) / refTn * rt;
+      const p = hipsInfo.restHipPos.clone();
+      p.y += lastOff;
+      const q = p.applyMatrix4(hipsInfo.T);
+      hipPos.push(q.x, q.y, q.z);
+    }
+
+    const tracks = names.map(k => new THREE.QuaternionKeyframeTrack(k + '.quaternion', times, vals[k]));
+    if (hipsInfo) tracks.push(new THREE.VectorKeyframeTrack(hipsInfo.bone.name + '.position', times, hipPos));
+    clip = new THREE.AnimationClip('animacao_video', -1, tracks);
+    mixer = new THREE.AnimationMixer(character);
+    mixer.clipAction(clip).play();
+
+    $('prev').disabled = false;
+    $('exp').disabled = false;
+    $('prev').textContent = 'Ver preview';
+    log(`pronto: ${n} quadros, ${ok} com pose detectada.\nToque em "Ver preview" para o personagem seguir o vídeo.`);
+    if (ok === 0) log('aviso: nenhum quadro teve pose detectada. Verifique se o corpo inteiro aparece no vídeo.');
+  } catch (err) {
+    log('erro: ' + (err.message || err));
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+// ---------- exportação ----------
+function exportGLB() {
+  if (!clip || !character) return;
+  exporting = true;
+  for (const b of bonesAll) b.quaternion.copy(restLocal.get(b));
+  new GLTFExporter().parse(character, buf => {
+    const url = URL.createObjectURL(new Blob([buf], {type: 'model/gltf-binary'}));
+    const a = Object.assign(document.createElement('a'), {href: url, download: 'personagem_animacao_video.glb'});
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    exporting = false;
+    log('GLB exportado.');
+  }, err => {
+    exporting = false;
+    log('erro ao exportar: ' + (err.message || err));
+  }, {binary: true, animations: [clip]});
+}
+</script>
+</body>
+</html>
